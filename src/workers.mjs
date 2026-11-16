@@ -3,6 +3,7 @@ import { isAbsolute } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 
 const MAX_BYTES = 1024 * 1024;
+const MAX_STREAM_BYTES = 64 * 1024 * 1024;
 const MAX_PROMPT_BYTES = 128 * 1024;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MODEL = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
@@ -140,6 +141,10 @@ export function createCodexWorker({ codexBin = 'codex', model, spawnImpl = spawn
             fail(new WorkerError('CODEX_PROTOCOL', 'Codex returned an invalid response.'));
             return;
           }
+          if (Buffer.byteLength(event.item.text, 'utf8') > MAX_BYTES) {
+            fail(new WorkerError('OUTPUT_LIMIT', 'Codex exceeded the 1 MiB result limit.'));
+            return;
+          }
           text = event.item.text;
         }
         if (event.type === 'turn.completed') completed = true;
@@ -167,8 +172,8 @@ export function createCodexWorker({ codexBin = 'codex', model, spawnImpl = spawn
       });
       child.stdout.on('data', (chunk) => {
         stdoutBytes += chunk.length;
-        if (stdoutBytes > MAX_BYTES) {
-          fail(new WorkerError('OUTPUT_LIMIT', 'Codex exceeded the 1 MiB output limit.'));
+        if (stdoutBytes > MAX_STREAM_BYTES) {
+          fail(new WorkerError('OUTPUT_LIMIT', 'Codex exceeded the 64 MiB stream limit.'));
           return;
         }
         if (failure) return;

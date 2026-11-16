@@ -1,3 +1,4 @@
+import { createJobWebhooks } from './webhook.mjs';
 import { initialize, configDirectory, loadConfig, readToken } from './config.mjs';
 import { discoverProjects } from './projects.mjs';
 import { createCodexWorker, createOpenAIWorker } from './workers.mjs';
@@ -25,6 +26,8 @@ async function main() {
   const proxyState = await loadProxyState();
   const service = createService({ discover, openAIWorker, proxyState,
     codexWorker: createCodexWorker({ codexBin: config.codexBin, model: config.codexModel }),
+    webhookTargets: Object.keys(config.webhooks), defaultWebhook: config.defaultWebhook,
+    onJobFinished: createJobWebhooks(config),
     jobTimeoutMs: config.jobTimeoutMinutes * 60_000,
   });
   const server = createHttpServer({ service, token, allowedHosts: config.allowedHosts, allowedOrigins: config.allowedOrigins });

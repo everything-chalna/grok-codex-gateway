@@ -69,11 +69,13 @@ test('official SDK client initializes, lists all tools, and starts/polls a job',
   const started = await client.callTool({ name: 'codex_start', arguments: { project: 'project-1', prompt: 'Inspect this project', requestId: 'request-1' } });
   assert.equal(started.structuredContent.jobId, 'job-1');
   assert.deepEqual(calls, [['codex', { project: 'project-1', prompt: 'Inspect this project', mode: 'read-only', requestId: 'request-1' }]]);
-  await client.callTool({ name: 'codex_start', arguments: { project: 'project-1', prompt: 'Commit authorized changes', mode: 'workspace-write-git', requestId: 'request-git-1' } });
+  await client.callTool({ name: 'codex_start', arguments: { project: 'project-1', prompt: 'Commit authorized changes', mode: 'workspace-write-git', requestId: 'request-git-1', notify: 'main' } });
   assert.equal(calls[1][1].mode, 'workspace-write-git');
+  assert.equal(calls[1][1].notify, 'main');
   assert.equal((await client.callTool({ name: 'job_status', arguments: { jobId: 'job-1' } })).structuredContent.status, 'completed');
   assert.equal((await client.callTool({ name: 'job_result', arguments: { jobId: 'job-1' } })).structuredContent.result, 'Example result');
-  assert.equal((await client.callTool({ name: 'codex_followup', arguments: { jobId: 'job-1', prompt: 'Explain more', requestId: 'request-2' } })).structuredContent.jobId, 'job-2');
+  assert.equal((await client.callTool({ name: 'codex_followup', arguments: { jobId: 'job-1', prompt: 'Explain more', requestId: 'request-2', notify: 'default' } })).structuredContent.jobId, 'job-2');
+  assert.equal(calls.find(([kind]) => kind === 'followup')[1].notify, 'default');
   assert.equal((await client.callTool({ name: 'openai_start', arguments: { prompt: 'Explain MCP', requestId: 'request-3' } })).structuredContent.jobId, 'job-3');
   assert.equal((await client.callTool({ name: 'job_cancel', arguments: { jobId: 'job-1' } })).structuredContent.status, 'cancelled');
 });

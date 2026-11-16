@@ -5,7 +5,30 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
 
+const targetName = z.string().regex(/^[a-z0-9_-]{1,32}$/);
+const httpsUrl = z.string().url().refine(value => {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && !url.username && !url.password;
+  } catch { return false; }
+});
+const filePath = z.string().min(1).refine(value => !value.includes('\0'));
+const targetFields = {
+  url: httpsUrl.optional(),
+  urlFile: filePath.optional(),
+  keyFile: filePath,
+  headerName: z.string().regex(/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/)
+    .refine(value => !['content-type', 'host', 'content-length', 'connection', 'transfer-encoding'].includes(value.toLowerCase()))
+    .default('Authorization'),
+  headerValuePrefix: z.string().regex(/^[\x20-\x7e]*$/).default('Bearer '),
+};
+const oneUrlSource = value => (value.url !== undefined) !== (value.urlFile !== undefined);
 const configSchema = z.object({
+  webhook: z.object({ ...targetFields,
+    keyFile: filePath.default('~/.config/grok-codex-gateway/webhook.key'),
+  }).strict().refine(oneUrlSource).optional(),
+  webhooks: z.record(targetName, z.object(targetFields).strict().refine(oneUrlSource)).default({}),
+  defaultWebhook: targetName.default('default'),
   roots: z.array(z.string().min(1)).min(1).max(30).default(['~']),
   gangliaRoot: z.string().min(1).default('~/ganglia'),
   gangliaMappings: z.record(z.string(), z.string()).default({}),
@@ -32,6 +55,27 @@ export async function loadConfig(directory = configDirectory()) {
   const parsed = configSchema.safeParse(value);
   if (!parsed.success) throw new Error('Invalid gateway config.json. Check the documented keys and value types.');
   const config = parsed.data;
+  if (config.webhook && Object.hasOwn(config.webhooks, 'default')) {
+    throw new Error('Configure either webhook or webhooks.default, not both.');
+  }
+  if (config.webhook) config.webhooks.default = config.webhook;
+  if (value.defaultWebhook !== undefined && !Object.hasOwn(config.webhooks, config.defaultWebhook)) {
+    throw new Error('defaultWebhook must name a configured webhook target.');
+  }
+  for (const target of Object.values(config.webhooks)) {
+    for (const field of ['keyFile', 'urlFile']) {
+      if (target[field] === undefined) continue;
+      target[field] = expand(target[field]);
+      if (!path.isAbsolute(target[field])) throw new Error(`Webhook ${field} must be an absolute path or start with ~/`);
+    }
+    if (target.urlFile) {
+      let url;
+      try { url = (await readFile(target.urlFile, 'utf8')).trim(); }
+      catch { throw new Error('Cannot read webhook urlFile.'); }
+      if (!httpsUrl.safeParse(url).success) throw new Error('Webhook urlFile must contain a valid HTTPS URL without user credentials.');
+      target.url = url;
+    }
+  }
   config.roots = config.roots.map(expand);
   config.gangliaRoot = expand(config.gangliaRoot);
   config.gangliaMappings = Object.fromEntries(Object.entries(config.gangliaMappings).map(([key, location]) => [key, expand(location)]));

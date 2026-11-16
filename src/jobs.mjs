@@ -8,7 +8,15 @@ export class GatewayError extends Error {
 // for as long as its job is retained; it is not an authentication credential.
 export function createService({ discover, codexWorker, openAIWorker = null,
   proxyState = { enabled: true, persist: async () => {} },
+  onJobFinished = () => {}, webhookTargets = [], defaultWebhook = 'default',
   maxJobs = 100, maxQueue = 10, jobTimeoutMs = 30 * 60_000 }) {
+  const targets = new Set(webhookTargets);
+  const resolveNotify = notify => {
+    if (notify !== undefined && (typeof notify !== 'string' || !/^[a-z0-9_-]{1,32}$/.test(notify) || !targets.has(notify))) {
+      throw new GatewayError('Unknown notify target. Use a configured webhook target name.');
+    }
+    return notify ?? defaultWebhook;
+  };
   let proxyEnabled = proxyState.enabled;
   let switchQueue = Promise.resolve();
   const proxyStatus = () => ({ enabled: proxyEnabled,
@@ -29,10 +37,19 @@ export function createService({ discover, codexWorker, openAIWorker = null,
     return job;
   };
   const status = (job) => ({
-    jobId: job.id, kind: job.kind, state: job.state, project: job.project?.id,
+    jobId: job.id, kind: job.kind, notify: job.notify, state: job.state, project: job.project?.id,
     mode: job.payload.mode, createdAt: job.createdAt, startedAt: job.startedAt,
     finishedAt: job.finishedAt, progress: job.progress, error: job.error,
   });
+  const notifyFinished = (job) => {
+    // Explicit allowlist: never send worker output, prompts, paths or raw errors.
+    const event = { event: 'codex_job_finished', jobId: job.id, kind: job.kind, notify: job.notify,
+      state: job.state, projectName: job.project?.name ?? null, requestId: job.requestId,
+      createdAt: job.createdAt, finishedAt: job.finishedAt,
+      error: job.error ? 'Worker failed.' : null };
+    try { Promise.resolve(onJobFinished(event)).catch(() => {}); }
+    catch { /* Completion observers must never affect jobs. */ }
+  };
   const prune = () => {
     for (const [id, job] of jobs) {
       if (jobs.size < maxJobs) break;
@@ -90,6 +107,7 @@ export function createService({ discover, codexWorker, openAIWorker = null,
         job.finishedAt = new Date().toISOString();
         // Requests retain a digest, not the input. CLI session retention is separate.
         delete job.payload.prompt;
+        notifyFinished(job);
         running = null;
         schedule();
       }
@@ -110,7 +128,7 @@ export function createService({ discover, codexWorker, openAIWorker = null,
     if (previous.fingerprint !== requestFingerprint(identity)) throw new GatewayError('requestId already belongs to a different request.');
     return status(get(previous.jobId));
   }
-  function enqueue(kind, payload, requestId, project, identity) {
+  function enqueue(kind, payload, requestId, project, identity, notify = defaultWebhook) {
     if (stopping) throw new GatewayError('Gateway is shutting down.');
     if (typeof requestId !== 'string' || !/^[a-zA-Z0-9_.:-]{1,100}$/.test(requestId)) {
       throw new GatewayError('Supply a requestId of 1–100 letters, digits, dots, colons, underscores or hyphens.');
@@ -130,7 +148,7 @@ export function createService({ discover, codexWorker, openAIWorker = null,
     }
     prune();
     if (jobs.size >= maxJobs) throw new GatewayError('Job capacity reached.');
-    const job = { id: randomUUID(), kind, payload: { ...payload }, requestId, project,
+    const job = { id: randomUUID(), kind, payload: { ...payload }, requestId, project, notify,
       state: 'queued', createdAt: new Date().toISOString(), progress: 'queued' };
     jobs.set(job.id, job);
     requests.set(requestId, { fingerprint, jobId: job.id });
@@ -154,17 +172,19 @@ export function createService({ discover, codexWorker, openAIWorker = null,
       const result = await discover();
       return { ...result, backends: { codex: proxyEnabled, openai: Boolean(openAIWorker) } };
     },
-    async startCodex({ project: id, prompt, mode = 'read-only', requestId }) {
+    async startCodex({ project: id, prompt, mode = 'read-only', requestId, notify }) {
+      notify = resolveNotify(notify);
       if (!['read-only', 'workspace-write', 'workspace-write-git'].includes(mode)) throw new GatewayError('Unsupported sandbox mode.');
-      const identity = { kind: 'codex', project: id, prompt, mode };
+      const identity = { kind: 'codex', project: id, prompt, mode, notify };
       const existing = retry(requestId, identity);
       if (existing) return existing;
       requireProxy();
       const project = await resolveProject(id);
-      return enqueue('codex', { projectPath: project.path, prompt, mode }, requestId, project, identity);
+      return enqueue('codex', { projectPath: project.path, prompt, mode }, requestId, project, identity, notify);
     },
-    async followup({ jobId, prompt, requestId }) {
-      const identity = { kind: 'followup', jobId, prompt };
+    async followup({ jobId, prompt, requestId, notify }) {
+      notify = resolveNotify(notify);
+      const identity = { kind: 'followup', jobId, prompt, notify };
       const existing = retry(requestId, identity);
       if (existing) return existing;
       requireProxy();
@@ -174,7 +194,7 @@ export function createService({ discover, codexWorker, openAIWorker = null,
       }
       const project = await resolveProject(previous.project.id);
       return enqueue('codex', { projectPath: project.path, prompt, mode: previous.payload.mode,
-        threadId: previous.result.threadId }, requestId, project, identity);
+        threadId: previous.result.threadId }, requestId, project, identity, notify);
     },
     async startOpenAI({ prompt, requestId }) {
       if (!openAIWorker) throw new GatewayError('OpenAI text backend is not configured on this computer.');
@@ -191,6 +211,7 @@ export function createService({ discover, codexWorker, openAIWorker = null,
       job.stopReason ??= 'cancelled';
       if (job.state === 'queued') {
         job.state = 'cancelled'; job.finishedAt = new Date().toISOString(); delete job.payload.prompt;
+        notifyFinished(job);
       } else { job.state = 'cancelling'; job.controller.abort(); }
       return status(job);
     },

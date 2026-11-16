@@ -229,6 +229,60 @@ Suggested saved Bot instructions:
 
 The gateway cannot change Grok account settings, save these instructions for you, or grant local Shell permission. If Codex is unavailable, switch the proxy off explicitly; there is no automatic failover.
 
+## Optional job-completion webhook
+
+The legacy `webhook` object remains the target named `default`, including its
+existing default key path. Alternatively, define named targets with `webhooks`.
+Add these settings to your private `config.json` (paths and file contents below
+are examples):
+
+```json
+{
+  "webhooks": {
+    "default": {
+      "urlFile": "~/.config/grok-codex-gateway/webhook.url",
+      "keyFile": "~/.config/grok-codex-gateway/webhook.key"
+    },
+    "main": {
+      "urlFile": "~/.config/grok-codex-gateway/main.webhook.url",
+      "keyFile": "~/.config/grok-codex-gateway/main.webhook.key"
+    }
+  },
+  "defaultWebhook": "default"
+}
+```
+
+Target names must match `/^[a-z0-9_-]{1,32}$/`. Each named target requires
+`keyFile` and exactly one of `url` or `urlFile`. For example, URL files contain
+`https://example.test/job-finished` and `https://example.test/main-job-finished`;
+key files contain `EXAMPLE_NOT_A_SECRET` until replaced with actual keys.
+URLs must use HTTPS without user credentials. URL files are read, trimmed and
+validated at startup; restart after changing them. File paths must be absolute
+or start with `~/`. Headers default to `headerName: "Authorization"` and
+`headerValuePrefix: "Bearer "`.
+
+`codex_start` and `codex_followup` accept optional `notify: "main"`. Unknown
+names are rejected before a job is accepted. Omission uses `defaultWebhook`
+(default `"default"`), including followups; the parent target is not inherited.
+An explicitly configured `defaultWebhook` must name an existing target.
+If the implicit `default` target is absent, jobs without `notify` send no webhook.
+Legacy `webhook` may coexist with other named targets, but configuring both
+`webhook` and `webhooks.default` is rejected as ambiguous. OpenAI jobs use the
+default target.
+
+Store keys only in `keyFile`, outside this checkout. Never put keys in config
+JSON. Missing or empty key files disable delivery; keys are read for each
+notification. Use private file permissions such as `0600` for config and files.
+
+Completed, failed, cancelled and timed-out jobs send a fire-and-forget JSON POST
+with `event: "codex_job_finished"`, `jobId`, `kind`, `state`, `projectName`,
+`requestId`, `notify` (the resolved target name), `createdAt`, `finishedAt`, and `error`. OpenAI jobs have a null
+project name; errors are generic, with null for jobs without an error. Prompts,
+result text, paths and credentials are excluded. Each attempt has a 10-second
+timeout; network errors and HTTP 5xx trigger one retry after 5 seconds. Redirects
+are not followed. Failures never change job status. Delivery is best effort and
+is not persisted across gateway shutdowns; receivers should deduplicate by job ID.
+
 ## Configuration reference
 
 This is an example of the supported configuration keys with their default values. Setup omits `maxDepth` and `codexBin`; loading the configuration supplies those defaults.
@@ -270,8 +324,8 @@ Restart the gateway after editing `config.json`. Proxy switching is the exceptio
 | `projects_list` | `{}` | List eligible projects, warnings, and configured backend status. |
 | `proxy_status` | `{}` | Read the Codex proxy switch and selected execution backend. |
 | `proxy_set_enabled` | `enabled` | Persistently enable or disable Codex delegation. |
-| `codex_start` | `project`, `prompt`, `mode`, `requestId` | Start a Codex task; `mode` defaults to `read-only`. |
-| `codex_followup` | `jobId`, `prompt`, `requestId` | Continue a completed, retained Codex job with a session ID. |
+| `codex_start` | `project`, `prompt`, `mode`, `requestId`, optional `notify` | Start a Codex task; `mode` defaults to `read-only`. |
+| `codex_followup` | `jobId`, `prompt`, `requestId`, optional `notify` | Continue a completed, retained Codex job with a session ID. |
 | `openai_start` | `prompt`, `requestId` | Start an independent OpenAI text request. |
 | `job_status` | `jobId` | Read progress and job state. |
 | `job_result` | `jobId` | Read final text when the job is completed. |

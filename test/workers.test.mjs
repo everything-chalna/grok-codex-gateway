@@ -125,7 +125,7 @@ test('Codex never reports partial or failed output as a completed result', async
 test('Codex limits stdout and stderr independently without returning captured diagnostics', async () => {
   for (const stream of ['stdout', 'stderr']) {
     const worker = createCodexWorker({
-      spawnImpl: fixture(`process.${stream}.write('x'.repeat(1024 * 1024 + 1)); setInterval(() => {}, 1000);`),
+      spawnImpl: fixture(`process.${stream}.write('x'.repeat(${stream === 'stdout' ? 64 : 1} * 1024 * 1024 + 1)); setInterval(() => {}, 1000);`),
     });
     await assert.rejects(worker(request), { code: 'OUTPUT_LIMIT' });
   }
@@ -214,4 +214,16 @@ test('OpenAI aborts without propagating remote error bodies', async () => {
       throw new Error('EXAMPLE_NOT_A_SECRET');
     } } } });
   await assert.rejects(worker({ prompt: 'Question.' }, { signal: controller.signal }), { code: 'CANCELLED' });
+});
+
+
+test('Codex accepts large JSONL streams but caps UTF-8 result text at 1 MiB', async () => {
+  const worker = createCodexWorker({ spawnImpl: fixture(`${emit}
+    for (let i = 0; i < 32; i++) emit({type:'item.updated', data:'x'.repeat(65536)});
+    ${success.slice(emit.length)}`) });
+  assert.equal((await worker(request)).text, 'Completed safely.');
+  const oversized = createCodexWorker({ spawnImpl: fixture(`${emit}
+    emit({type:'item.completed',item:{type:'agent_message',text:'한'.repeat(400000)}});
+    emit({type:'turn.completed'});`) });
+  await assert.rejects(oversized(request), { code: 'OUTPUT_LIMIT' });
 });
