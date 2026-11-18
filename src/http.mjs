@@ -10,6 +10,7 @@ const promptSchema = z.string().trim().min(1).max(32_000);
 const idSchema = z.string().min(1).max(160).regex(/^[a-zA-Z0-9._:-]+$/);
 const requestIdSchema = z.string().min(1).max(100).regex(/^[a-zA-Z0-9._:-]+$/);
 const objectSchema = z.record(z.string(), z.unknown());
+const targetSchema = z.string().regex(/^[a-z0-9_-]{1,32}$/);
 
 function toolResult(value, isError = false) {
   return {
@@ -43,20 +44,20 @@ function createToolServer(service) {
     'List local projects eligible for Codex through their AGENTS.md or the configured Ganglia registry. Use the returned project ID when starting work.',
     z.object({}).strict(), () => service.listProjects(), true);
   register('codex_start',
-    'Start a local Codex job in a listed project. Defaults to read-only. workspace-write allows project edits. workspace-write-git additionally allows writes to that project\'s .git directory and outbound network access for git push/GitHub CLI; use only with explicit user authorization. Optional notify selects a configured webhook target; omitted uses defaultWebhook. Returns a job ID; poll job_status and read job_result.',
-    z.object({ project: idSchema, prompt: promptSchema, notify: z.string().regex(/^[a-z0-9_-]{1,32}$/).optional(), mode: z.enum(['read-only', 'workspace-write', 'workspace-write-git']).default('read-only'), requestId: requestIdSchema }).strict(),
+    'Start a local Codex job in a listed project. Defaults to read-only. workspace-write allows project edits. workspace-write-git additionally allows writes to that project\'s .git directory and outbound network access for git push/GitHub CLI; use only with explicit user authorization. Pass notify (or its alias owner) set to your own configured webhook target name: it becomes the job owner, receives the completion webhook, and is the owner for jobs_pending/job_ack. Omitted uses defaultWebhook. Returns a job ID; poll job_status and read job_result.',
+    z.object({ project: idSchema, prompt: promptSchema, notify: targetSchema.optional(), owner: targetSchema.optional(), mode: z.enum(['read-only', 'workspace-write', 'workspace-write-git']).default('read-only'), requestId: requestIdSchema }).strict(),
     (input) => service.startCodex(input));
   register('proxy_status', 'Read the Codex proxy mode and chosen project execution backend. Subscription balance is unknown; switching is manual.',
     z.object({}).strict(), () => service.proxyStatus(), true);
   register('proxy_set_enabled', 'Persist the Codex proxy mode. Disabled selects Grok approved local Shell for new project work; existing jobs remain accessible and continue.',
     z.object({ enabled: z.boolean() }).strict(), ({ enabled }) => service.setProxyEnabled(enabled));
   register('codex_followup',
-    'Continue a completed Codex job with another prompt, retaining its project and sandbox mode. Optional notify selects a configured webhook target; omitted uses defaultWebhook (not the parent target). Returns a new job ID.',
-    z.object({ jobId: idSchema, prompt: promptSchema, notify: z.string().regex(/^[a-z0-9_-]{1,32}$/).optional(), requestId: requestIdSchema }).strict(),
+    'Continue a completed Codex job with another prompt, retaining its project, sandbox mode and owner. Optional notify (or alias owner) overrides the owner; omitted inherits the parent job\'s owner. Returns a new job ID.',
+    z.object({ jobId: idSchema, prompt: promptSchema, notify: targetSchema.optional(), owner: targetSchema.optional(), requestId: requestIdSchema }).strict(),
     (input) => service.followup(input));
   register('openai_start',
-    'Start an OpenAI API text job. Requires the locally configured API backend; this does not control an existing ChatGPT conversation. Returns a job ID.',
-    z.object({ prompt: promptSchema, requestId: requestIdSchema }).strict(),
+    'Start an OpenAI API text job. Requires the locally configured API backend; this does not control an existing ChatGPT conversation. Optional notify (or alias owner) names the owner as for codex_start. Returns a job ID.',
+    z.object({ prompt: promptSchema, notify: targetSchema.optional(), owner: targetSchema.optional(), requestId: requestIdSchema }).strict(),
     (input) => service.startOpenAI(input));
   register('job_status', 'Read the status of a gateway job.',
     z.object({ jobId: idSchema }).strict(), ({ jobId }) => service.getStatus(jobId), true);
@@ -64,6 +65,15 @@ function createToolServer(service) {
     z.object({ jobId: idSchema }).strict(), ({ jobId }) => service.getResult(jobId), true);
   register('job_cancel', 'Cancel a running gateway job.',
     z.object({ jobId: idSchema }).strict(), ({ jobId }) => service.cancel(jobId));
+  register('jobs_pending',
+    'List your finished (completed, failed, cancelled, timed_out, interrupted) jobs that you have not acknowledged yet, newest first. owner is your own notify target name. Job records persist across gateway restarts, so call this on every wakeup: the webhook only reduces latency and can be missed. Report each result, then job_ack it.',
+    z.object({ owner: targetSchema }).strict(), (input) => service.listPending(input), true);
+  register('job_ack',
+    'Mark one of your finished jobs as reported so jobs_pending stops listing it. Refused when owner does not match the job owner; never acknowledge another bot\'s job.',
+    z.object({ jobId: idSchema, owner: targetSchema }).strict(), (input) => service.ack(input));
+  register('jobs_list',
+    'List your jobs in any state, newest first (limit 1-100, default 20), including acknowledgement and webhook delivery status.',
+    z.object({ owner: targetSchema, limit: z.number().int().min(1).max(100).default(20) }).strict(), (input) => service.listJobs(input), true);
   return server;
 }
 

@@ -5,6 +5,7 @@ import { createCodexWorker, createOpenAIWorker } from './workers.mjs';
 import { createService } from './jobs.mjs';
 import { createHttpServer } from './http.mjs';
 import { loadProxyState } from './proxy.mjs';
+import { createJobStore } from './store.mjs';
 
 async function main() {
   const command = process.argv[2] ?? 'serve';
@@ -24,9 +25,10 @@ async function main() {
   const openAIWorker = process.env.OPENAI_API_KEY && config.openaiModel
     ? createOpenAIWorker({ apiKey: process.env.OPENAI_API_KEY, model: config.openaiModel }) : null;
   const proxyState = await loadProxyState();
+  const store = await createJobStore();
   const service = createService({ discover, openAIWorker, proxyState,
     codexWorker: createCodexWorker({ codexBin: config.codexBin, model: config.codexModel }),
-    webhookTargets: Object.keys(config.webhooks), defaultWebhook: config.defaultWebhook,
+    webhookTargets: Object.keys(config.webhooks), defaultWebhook: config.defaultWebhook, store,
     onJobFinished: createJobWebhooks(config),
     jobTimeoutMs: config.jobTimeoutMinutes * 60_000,
   });
@@ -45,6 +47,7 @@ async function main() {
   server.listen(config.port, '127.0.0.1', () => {
     console.log(`MCP gateway listening on http://127.0.0.1:${config.port}/mcp (bearer authentication required).`);
     console.log(`Codex: local CLI. OpenAI text: ${openAIWorker ? 'configured' : 'not configured'}.`);
+    console.log(`Job records restored from private state: ${store.records.length}.`);
   });
 }
 main().catch((error) => {

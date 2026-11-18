@@ -63,7 +63,7 @@ test('official SDK client initializes, lists all tools, and starts/polls a job',
   t.after(() => client.close());
   await client.connect(transport);
   const listing = await client.listTools();
-  assert.deepEqual(listing.tools.map((tool) => tool.name).sort(), ['projects_list', 'proxy_status', 'proxy_set_enabled', 'codex_start', 'codex_followup', 'openai_start', 'job_status', 'job_result', 'job_cancel'].sort());
+  assert.deepEqual(listing.tools.map((tool) => tool.name).sort(), ['projects_list', 'proxy_status', 'proxy_set_enabled', 'codex_start', 'codex_followup', 'openai_start', 'job_status', 'job_result', 'job_cancel', 'jobs_pending', 'job_ack', 'jobs_list'].sort());
   const projects = await client.callTool({ name: 'projects_list', arguments: {} });
   assert.equal(projects.structuredContent.projects[0].id, 'project-1');
   const started = await client.callTool({ name: 'codex_start', arguments: { project: 'project-1', prompt: 'Inspect this project', requestId: 'request-1' } });
@@ -87,7 +87,7 @@ test('legacy MCP initialize and stateless POST requests work without a session',
   assert.equal(response.headers.get('mcp-session-id'), null);
   assert.equal((await response.json()).result.serverInfo.name, 'grok-codex-gateway');
   assert.equal((await send({ jsonrpc: '2.0', method: 'notifications/initialized' })).status, 202);
-  assert.equal((await rpc('tools/list')).result.tools.length, 9);
+  assert.equal((await rpc('tools/list')).result.tools.length, 12);
 });
 
 test('bearer authentication, exact Host and Origin gates reject unauthorized calls', async (t) => {

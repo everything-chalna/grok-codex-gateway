@@ -50,6 +50,13 @@ test('HTTP tool schemas and the real job service agree on modes, errors and retr
   }
   assert.equal(result.structuredContent.result, 'Gateway integration verified');
   assert.equal(executions, 1);
+  const pending = await call('jobs_pending', { owner: 'default' });
+  assert.deepEqual(pending.structuredContent.jobs.map(job => job.jobId), [id]);
+  assert.equal((await call('jobs_pending', { owner: 'someone-else' })).isError, true);
+  assert.equal((await call('job_ack', { jobId: id, owner: 'someone-else' })).isError, true);
+  assert.equal((await call('job_ack', { jobId: id, owner: 'default' })).structuredContent.acked, true);
+  assert.equal((await call('jobs_pending', { owner: 'default' })).structuredContent.count, 0);
+  assert.equal((await call('jobs_list', { owner: 'default' })).structuredContent.jobs[0].acked, true);
   const failed = await call('codex_start', { ...input, project: 'unlisted', requestId: 'two' });
   assert.equal(failed.isError, true);
   assert.match(failed.structuredContent.error, /ineligible/);

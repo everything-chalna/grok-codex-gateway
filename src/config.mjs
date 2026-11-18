@@ -29,6 +29,7 @@ const configSchema = z.object({
   }).strict().refine(oneUrlSource).optional(),
   webhooks: z.record(targetName, z.object(targetFields).strict().refine(oneUrlSource)).default({}),
   defaultWebhook: targetName.default('default'),
+  fallbackToDefault: z.boolean().default(false),
   roots: z.array(z.string().min(1)).min(1).max(30).default(['~']),
   gangliaRoot: z.string().min(1).default('~/ganglia'),
   gangliaMappings: z.record(z.string(), z.string()).default({}),

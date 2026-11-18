@@ -58,7 +58,7 @@ test('terminal jobs POST only the allowed metadata once, without prompt, output,
   assert.equal(headers['content-type'], 'application/json');
   const status = service.getStatus(job.jobId);
   assert.deepEqual(body, { event: 'codex_job_finished', jobId: job.jobId, kind: 'codex', state: 'completed',
-    notify: 'default', projectName: 'Example', requestId: 'request-one', createdAt: status.createdAt, finishedAt: status.finishedAt, error: null });
+    owner: 'default', notify: 'default', route: 'default', projectName: 'Example', requestId: 'request-one', createdAt: status.createdAt, finishedAt: status.finishedAt, error: null });
   assert.doesNotMatch(JSON.stringify(body), /PRIVATE_|EXAMPLE_NOT_A_SECRET|projectPath/);
   assert.equal(f.requests.length, 1);
 });
@@ -153,9 +153,11 @@ test('loaded legacy and named targets route starts and followups, including URL 
   await until(() => deliveries.length === 3);
   assert.equal(deliveries[2].url, 'https://example.test/main');
   await assert.rejects(service.startCodex({ ...start, notify: 'main' }), /different request/);
-  await service.followup({ jobId: next.jobId, prompt: 'fixture', requestId: 'default-again' });
+  // A followup without notify inherits its parent's owner instead of defaultWebhook.
+  await service.followup({ jobId: next.jobId, prompt: 'fixture', requestId: 'inherited' });
   await until(() => deliveries.length === 4);
-  assert.equal(deliveries[3].body.notify, 'default');
+  assert.equal(deliveries[3].body.owner, 'main');
+  assert.equal(deliveries[3].url, 'https://example.test/main');
   const alternate = createService({ discover: async () => ({ projects: [project] }),
     codexWorker: async () => ({ text: 'fixture' }), webhookTargets: ['main'], defaultWebhook: 'main', onJobFinished: sender });
   t.after(() => alternate.close());

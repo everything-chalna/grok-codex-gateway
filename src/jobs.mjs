@@ -4,18 +4,49 @@ export class GatewayError extends Error {
   constructor(message) { super(message); this.name = 'GatewayError'; this.safe = true; }
 }
 
-// One trusted owner, one worker at a time. A request ID deduplicates retries
-// for as long as its job is retained; it is not an authentication credential.
+const TERMINAL = ['completed', 'failed', 'cancelled', 'timed_out', 'interrupted'];
+const TARGET_NAME = /^[a-z0-9_-]{1,32}$/;
+const EXIT_CODES = { completed: 0, failed: 1, cancelled: 130, timed_out: 124, interrupted: 1 };
+const DELIVERY_STATES = ['pending', 'delivered', 'failed', 'skipped', 'unknown'];
+
+// Delivery results come from the webhook layer; keep only fixed, non-secret fields.
+function normalizeDelivery(result, owner) {
+  const value = result && typeof result === 'object' ? result : {};
+  const delivery = {
+    status: DELIVERY_STATES.includes(value.status) ? value.status : 'unknown',
+    route: typeof value.route === 'string' && TARGET_NAME.test(value.route) ? value.route : owner,
+    attempts: Number.isInteger(value.attempts) && value.attempts >= 0 && value.attempts < 100 ? value.attempts : 0,
+    httpStatus: Number.isInteger(value.httpStatus) && value.httpStatus >= 100 && value.httpStatus <= 599 ? value.httpStatus : null,
+    at: new Date().toISOString(),
+  };
+  if (typeof value.reason === 'string' && /^[a-z ]{1,60}$/.test(value.reason)) delivery.reason = value.reason;
+  if (typeof value.fallbackFrom === 'string' && TARGET_NAME.test(value.fallbackFrom)) delivery.fallbackFrom = value.fallbackFrom;
+  return delivery;
+}
+
+// Each job has an owner: the webhook target name of the bot that started it.
+// Owner routing is delivery discipline between trusted bots that share one
+// gateway token, not an authentication boundary. A request ID deduplicates
+// retries for as long as its job is retained; it is not a credential.
 export function createService({ discover, codexWorker, openAIWorker = null,
   proxyState = { enabled: true, persist: async () => {} },
-  onJobFinished = () => {}, webhookTargets = [], defaultWebhook = 'default',
+  onJobFinished = () => {}, webhookTargets = [], defaultWebhook = 'default', store = null,
   maxJobs = 100, maxQueue = 10, jobTimeoutMs = 30 * 60_000 }) {
   const targets = new Set(webhookTargets);
-  const resolveNotify = notify => {
-    if (notify !== undefined && (typeof notify !== 'string' || !/^[a-z0-9_-]{1,32}$/.test(notify) || !targets.has(notify))) {
-      throw new GatewayError('Unknown notify target. Use a configured webhook target name.');
+  const knownOwner = name => typeof name === 'string' && TARGET_NAME.test(name) && (targets.has(name) || name === defaultWebhook);
+  // `owner` is an alias of `notify`; both name a configured webhook target.
+  const explicitOwner = ({ notify, owner } = {}) => {
+    for (const name of [notify, owner]) {
+      if (name !== undefined && !knownOwner(name)) throw new GatewayError('Unknown notify target. Use a configured webhook target name.');
     }
-    return notify ?? defaultWebhook;
+    if (notify !== undefined && owner !== undefined && notify !== owner) {
+      throw new GatewayError('notify and owner must name the same target when both are supplied.');
+    }
+    return notify ?? owner;
+  };
+  const ownerFilter = owner => {
+    if (!knownOwner(owner)) throw new GatewayError('owner must name a configured webhook target.');
+    return owner;
   };
   let proxyEnabled = proxyState.enabled;
   let switchQueue = Promise.resolve();
@@ -30,32 +61,91 @@ export function createService({ discover, codexWorker, openAIWorker = null,
   let running = null;
   let stopping = false;
   let pumpScheduled = false;
-  const terminal = (job) => ['completed', 'failed', 'cancelled', 'timed_out'].includes(job.state);
+  const terminal = (job) => TERMINAL.includes(job.state);
   const get = (id) => {
     const job = jobs.get(id);
     if (!job) throw new GatewayError('Unknown or expired job ID.');
     return job;
   };
+  const toRecord = (job) => ({
+    version: 1, id: job.id, kind: job.kind, owner: job.owner, requestId: job.requestId,
+    fingerprint: job.fingerprint, parentJobId: job.parentJobId ?? null,
+    project: job.project ? { id: job.project.id, name: job.project.name ?? null, path: job.project.path } : null,
+    mode: job.payload.mode ?? null, state: job.state, progress: job.progress ?? null,
+    createdAt: job.createdAt, startedAt: job.startedAt ?? null, finishedAt: job.finishedAt ?? null,
+    error: job.error ?? null, exitCode: EXIT_CODES[job.state] ?? null,
+    result: job.state === 'completed' && job.result
+      ? { text: job.result.text, threadId: job.result.threadId ?? null } : null,
+    acked: job.acked, ackedAt: job.ackedAt, delivery: job.delivery,
+  });
+  // Persist only retained jobs; never the prompt (it is not in the record).
+  const persist = (job) => { if (store && jobs.get(job.id) === job) void store.save(toRecord(job)); };
   const status = (job) => ({
-    jobId: job.id, kind: job.kind, notify: job.notify, state: job.state, project: job.project?.id,
+    jobId: job.id, kind: job.kind, owner: job.owner, notify: job.owner, requestId: job.requestId,
+    parentJobId: job.parentJobId ?? null, state: job.state, project: job.project?.id,
     mode: job.payload.mode, createdAt: job.createdAt, startedAt: job.startedAt,
     finishedAt: job.finishedAt, progress: job.progress, error: job.error,
+    exitCode: EXIT_CODES[job.state] ?? null, acked: job.acked, ackedAt: job.ackedAt, delivery: job.delivery,
+  });
+  const summary = (job) => ({
+    jobId: job.id, requestId: job.requestId, kind: job.kind, owner: job.owner,
+    project: job.project?.id ?? null, projectName: job.project?.name ?? null, state: job.state,
+    createdAt: job.createdAt, finishedAt: job.finishedAt ?? null, error: job.error ?? null,
+    acked: job.acked, delivery: job.delivery,
   });
   const notifyFinished = (job) => {
     // Explicit allowlist: never send worker output, prompts, paths or raw errors.
-    const event = { event: 'codex_job_finished', jobId: job.id, kind: job.kind, notify: job.notify,
+    const event = { event: 'codex_job_finished', jobId: job.id, kind: job.kind,
+      owner: job.owner, notify: job.owner, route: job.owner,
       state: job.state, projectName: job.project?.name ?? null, requestId: job.requestId,
       createdAt: job.createdAt, finishedAt: job.finishedAt,
       error: job.error ? 'Worker failed.' : null };
-    try { Promise.resolve(onJobFinished(event)).catch(() => {}); }
-    catch { /* Completion observers must never affect jobs. */ }
+    job.delivery = { status: 'pending', route: job.owner, attempts: 0, httpStatus: null, at: null };
+    persist(job);
+    const record = (result) => { job.delivery = normalizeDelivery(result, job.owner); persist(job); };
+    // Completion observers must never affect jobs.
+    try { Promise.resolve(onJobFinished(event)).then(record, () => record({ status: 'failed' })); }
+    catch { record({ status: 'failed' }); }
   };
+  const evict = (id, job) => { jobs.delete(id); requests.delete(job.requestId); void store?.remove(id); };
   const prune = () => {
-    for (const [id, job] of jobs) {
-      if (jobs.size < maxJobs) break;
-      if (terminal(job)) { jobs.delete(id); requests.delete(job.requestId); }
+    // Acknowledged jobs go first; unacknowledged results are kept longest.
+    for (const eligible of [job => job.acked, () => true]) {
+      for (const [id, job] of jobs) {
+        if (jobs.size < maxJobs) return;
+        if (terminal(job) && eligible(job)) evict(id, job);
+      }
     }
   };
+  // Restore persisted records. Work that was queued or running when the
+  // previous process stopped cannot resume, so it is marked interrupted and
+  // left for the owner's jobs_pending instead of being rerun or notified.
+  const restored = [...(store?.records ?? [])]
+    .filter(record => typeof record.id === 'string' && ['codex', 'openai'].includes(record.kind)
+      && typeof record.requestId === 'string' && typeof record.fingerprint === 'string'
+      && typeof record.createdAt === 'string' && typeof record.owner === 'string' && TARGET_NAME.test(record.owner))
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  for (const record of restored) {
+    const job = { id: record.id, kind: record.kind, owner: record.owner, requestId: record.requestId,
+      fingerprint: record.fingerprint, parentJobId: record.parentJobId ?? null,
+      project: record.project ?? undefined,
+      payload: { ...(record.project ? { projectPath: record.project.path } : {}), ...(record.mode ? { mode: record.mode } : {}) },
+      state: record.state, progress: record.progress ?? undefined, createdAt: record.createdAt,
+      startedAt: record.startedAt ?? undefined, finishedAt: record.finishedAt ?? undefined, error: record.error ?? undefined,
+      result: record.result ? { text: record.result.text, ...(record.result.threadId ? { threadId: record.result.threadId } : {}) } : undefined,
+      acked: record.acked === true, ackedAt: record.ackedAt ?? null, delivery: record.delivery ?? null };
+    jobs.set(job.id, job);
+    requests.set(job.requestId, { fingerprint: job.fingerprint, jobId: job.id });
+    if (!terminal(job)) {
+      job.state = 'interrupted'; job.progress = 'interrupted';
+      job.finishedAt = new Date().toISOString();
+      job.error = 'Gateway stopped before the job finished. Check the project before retrying.';
+      job.delivery = { status: 'skipped', route: job.owner, attempts: 0, httpStatus: null,
+        at: job.finishedAt, reason: 'interrupted at startup' };
+      persist(job);
+    }
+  }
+  prune();
   function schedule() {
     if (pumpScheduled || stopping || running) return;
     pumpScheduled = true;
@@ -69,6 +159,7 @@ export function createService({ discover, codexWorker, openAIWorker = null,
     job.state = 'running';
     job.startedAt = new Date().toISOString();
     job.controller = new AbortController();
+    persist(job);
     const timer = setTimeout(() => {
       job.stopReason ??= 'timed_out'; job.state = 'cancelling'; job.controller.abort();
     }, jobTimeoutMs);
@@ -128,7 +219,7 @@ export function createService({ discover, codexWorker, openAIWorker = null,
     if (previous.fingerprint !== requestFingerprint(identity)) throw new GatewayError('requestId already belongs to a different request.');
     return status(get(previous.jobId));
   }
-  function enqueue(kind, payload, requestId, project, identity, notify = defaultWebhook) {
+  function enqueue(kind, payload, requestId, project, identity, owner = defaultWebhook, parentJobId = null) {
     if (stopping) throw new GatewayError('Gateway is shutting down.');
     if (typeof requestId !== 'string' || !/^[a-zA-Z0-9_.:-]{1,100}$/.test(requestId)) {
       throw new GatewayError('Supply a requestId of 1–100 letters, digits, dots, colons, underscores or hyphens.');
@@ -148,13 +239,15 @@ export function createService({ discover, codexWorker, openAIWorker = null,
     }
     prune();
     if (jobs.size >= maxJobs) throw new GatewayError('Job capacity reached.');
-    const job = { id: randomUUID(), kind, payload: { ...payload }, requestId, project, notify,
-      state: 'queued', createdAt: new Date().toISOString(), progress: 'queued' };
+    const job = { id: randomUUID(), kind, payload: { ...payload }, requestId, fingerprint, project, owner, parentJobId,
+      state: 'queued', createdAt: new Date().toISOString(), progress: 'queued', acked: false, ackedAt: null, delivery: null };
     jobs.set(job.id, job);
     requests.set(requestId, { fingerprint, jobId: job.id });
+    persist(job);
     schedule();
     return status(job);
   }
+  const newestFirst = (field) => (a, b) => (b[field] ?? '').localeCompare(a[field] ?? '');
   const service = {
     proxyStatus,
     setProxyEnabled(enabled) {
@@ -172,19 +265,20 @@ export function createService({ discover, codexWorker, openAIWorker = null,
       const result = await discover();
       return { ...result, backends: { codex: proxyEnabled, openai: Boolean(openAIWorker) } };
     },
-    async startCodex({ project: id, prompt, mode = 'read-only', requestId, notify }) {
-      notify = resolveNotify(notify);
+    async startCodex({ project: id, prompt, mode = 'read-only', requestId, notify, owner }) {
+      owner = explicitOwner({ notify, owner }) ?? defaultWebhook;
       if (!['read-only', 'workspace-write', 'workspace-write-git'].includes(mode)) throw new GatewayError('Unsupported sandbox mode.');
-      const identity = { kind: 'codex', project: id, prompt, mode, notify };
+      const identity = { kind: 'codex', project: id, prompt, mode, notify: owner };
       const existing = retry(requestId, identity);
       if (existing) return existing;
       requireProxy();
       const project = await resolveProject(id);
-      return enqueue('codex', { projectPath: project.path, prompt, mode }, requestId, project, identity, notify);
+      return enqueue('codex', { projectPath: project.path, prompt, mode }, requestId, project, identity, owner);
     },
-    async followup({ jobId, prompt, requestId, notify }) {
-      notify = resolveNotify(notify);
-      const identity = { kind: 'followup', jobId, prompt, notify };
+    async followup({ jobId, prompt, requestId, notify, owner }) {
+      // Without an explicit target the followup belongs to the parent's owner.
+      const explicit = explicitOwner({ notify, owner });
+      const identity = { kind: 'followup', jobId, prompt, notify: explicit ?? null };
       const existing = retry(requestId, identity);
       if (existing) return existing;
       requireProxy();
@@ -194,16 +288,39 @@ export function createService({ discover, codexWorker, openAIWorker = null,
       }
       const project = await resolveProject(previous.project.id);
       return enqueue('codex', { projectPath: project.path, prompt, mode: previous.payload.mode,
-        threadId: previous.result.threadId }, requestId, project, identity, notify);
+        threadId: previous.result.threadId }, requestId, project, identity, explicit ?? previous.owner ?? defaultWebhook, previous.id);
     },
-    async startOpenAI({ prompt, requestId }) {
+    async startOpenAI({ prompt, requestId, notify, owner }) {
+      owner = explicitOwner({ notify, owner }) ?? defaultWebhook;
       if (!openAIWorker) throw new GatewayError('OpenAI text backend is not configured on this computer.');
-      return enqueue('openai', { prompt }, requestId, undefined, { kind: 'openai', prompt });
+      return enqueue('openai', { prompt }, requestId, undefined, { kind: 'openai', prompt, notify: owner }, owner);
     },
     getStatus(id) { return status(get(id)); },
     getResult(id) {
       const job = get(id);
       return { ...status(job), result: job.state === 'completed' ? job.result.text : null };
+    },
+    listPending({ owner } = {}) {
+      ownerFilter(owner);
+      const items = [...jobs.values()].reverse()
+        .filter(job => job.owner === owner && terminal(job) && !job.acked)
+        .sort(newestFirst('finishedAt')).map(summary);
+      return { owner, count: items.length, jobs: items };
+    },
+    listJobs({ owner, limit = 20 } = {}) {
+      ownerFilter(owner);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new GatewayError('limit must be an integer from 1 to 100.');
+      const items = [...jobs.values()].reverse().filter(job => job.owner === owner)
+        .sort(newestFirst('createdAt')).slice(0, limit).map(summary);
+      return { owner, count: items.length, jobs: items };
+    },
+    ack({ jobId, owner } = {}) {
+      ownerFilter(owner);
+      const job = get(jobId);
+      if (job.owner !== owner) throw new GatewayError('This job belongs to another owner. Acknowledge only your own jobs.');
+      if (!terminal(job)) throw new GatewayError('Only a finished job can be acknowledged.');
+      if (!job.acked) { job.acked = true; job.ackedAt = new Date().toISOString(); persist(job); }
+      return summary(job);
     },
     cancel(id) {
       const job = get(id);
@@ -212,13 +329,14 @@ export function createService({ discover, codexWorker, openAIWorker = null,
       if (job.state === 'queued') {
         job.state = 'cancelled'; job.finishedAt = new Date().toISOString(); delete job.payload.prompt;
         notifyFinished(job);
-      } else { job.state = 'cancelling'; job.controller.abort(); }
+      } else { job.state = 'cancelling'; job.controller.abort(); persist(job); }
       return status(job);
     },
     async close() {
       stopping = true;
       for (const job of jobs.values()) if (!terminal(job)) service.cancel(job.id);
       if (running?.promise) await running.promise;
+      await store?.flush?.();
     },
   };
   return service;
