@@ -261,27 +261,72 @@ validated at startup; restart after changing them. File paths must be absolute
 or start with `~/`. Headers default to `headerName: "Authorization"` and
 `headerValuePrefix: "Bearer "`.
 
-`codex_start` and `codex_followup` accept optional `notify: "main"`. Unknown
-names are rejected before a job is accepted. Omission uses `defaultWebhook`
-(default `"default"`), including followups; the parent target is not inherited.
+### Job owners: each bot passes its own name
+
+Every job has an **owner**: the webhook target name of the bot that started it.
+`codex_start`, `codex_followup` and `openai_start` accept `notify: "main"` or the
+alias `owner: "main"` (if both are given they must match). Unknown names are
+rejected before a job is accepted. Omission uses `defaultWebhook` (default
+`"default"`). `codex_followup` without `notify`/`owner` **inherits the parent
+job's owner**; pass one explicitly only to hand the followup to another bot.
+
+Several Grok Bots can share one gateway token, so the gateway cannot tell them
+apart by itself. **Each bot must always pass its own target name** on every
+start, or its completions go to the default target and appear in the default
+owner's `jobs_pending`. Give every bot that uses the gateway its own entry in
+`webhooks` (for example `default`, `main`, `side2`). Owner routing is delivery
+discipline between trusted bots, not an authentication boundary.
+
 An explicitly configured `defaultWebhook` must name an existing target.
 If the implicit `default` target is absent, jobs without `notify` send no webhook.
 Legacy `webhook` may coexist with other named targets, but configuring both
-`webhook` and `webhooks.default` is rejected as ambiguous. OpenAI jobs use the
-default target.
+`webhook` and `webhooks.default` is rejected as ambiguous.
 
 Store keys only in `keyFile`, outside this checkout. Never put keys in config
 JSON. Missing or empty key files disable delivery; keys are read for each
 notification. Use private file permissions such as `0600` for config and files.
 
-Completed, failed, cancelled and timed-out jobs send a fire-and-forget JSON POST
-with `event: "codex_job_finished"`, `jobId`, `kind`, `state`, `projectName`,
-`requestId`, `notify` (the resolved target name), `createdAt`, `finishedAt`, and `error`. OpenAI jobs have a null
-project name; errors are generic, with null for jobs without an error. Prompts,
-result text, paths and credentials are excluded. Each attempt has a 10-second
-timeout; network errors and HTTP 5xx trigger one retry after 5 seconds. Redirects
-are not followed. Failures never change job status. Delivery is best effort and
-is not persisted across gateway shutdowns; receivers should deduplicate by job ID.
+### Completion webhook
+
+Completed, failed, cancelled and timed-out jobs send one JSON POST **to the
+owner's target only** with `event: "codex_job_finished"`, `jobId`, `kind`,
+`owner`, `notify` (same as owner, kept for compatibility), `route` (the target
+actually used), `state`, `projectName`, `requestId`, `createdAt`, `finishedAt`,
+and `error`. OpenAI jobs have a null project name; errors are generic, with null
+for jobs without an error. Prompts, result text, paths and credentials are
+excluded. Each attempt has a 10-second timeout; network errors and HTTP 5xx
+trigger one retry after 5 seconds. Redirects are not followed.
+
+The outcome is recorded on the job as `delivery`: `status` (`pending`,
+`delivered`, `failed`, `skipped`, or `unknown`), `route`, `attempts`,
+`httpStatus`, and a short `reason`. A failed delivery is **not** sent to other
+bots. Set `"fallbackToDefault": true` to retry a failed delivery once more on
+the `default` target (recorded as `fallbackFrom`); it is off by default.
+Delivery never changes job state. Receivers should deduplicate by job ID.
+
+### Pending results and acknowledgement
+
+Disk state is the source of truth; the webhook only reduces latency. Job records
+are written atomically, one file per job with mode `0600`, to
+`~/.config/grok-codex-gateway/state/jobs/` (outside the checkout; it follows
+`GATEWAY_CONFIG_DIR`). Records hold job metadata, owner, request fingerprint,
+result text and Codex session ID for completed jobs, acknowledgement and delivery
+status, never the prompt. They are restored at startup, so `job_status`,
+`job_result`, `codex_followup` and `requestId` deduplication keep working after
+a restart. Jobs that were queued or running when the previous process stopped
+are marked `interrupted` (no webhook is sent for them).
+
+Each bot, whenever it wakes (from its webhook routine or otherwise):
+
+1. Calls `jobs_pending {"owner": "<my name>"}` to list its finished, unacknowledged
+   jobs (completed, failed, cancelled, timed_out, interrupted), newest first.
+2. Reads `job_result`, verifies the work and reports it.
+3. Calls `job_ack {"jobId": "...", "owner": "<my name>"}`. Acknowledging another
+   owner's job is refused.
+
+Never rerun work only because a webhook was missed; check `jobs_pending` first.
+With the bundled client: `node gcg.mjs pending main` and
+`node gcg.mjs ack <jobId> main`.
 
 ## Configuration reference
 
@@ -297,7 +342,8 @@ This is an example of the supported configuration keys with their default values
   "allowedHosts": [],
   "allowedOrigins": [],
   "codexBin": "codex",
-  "jobTimeoutMinutes": 30
+  "jobTimeoutMinutes": 30,
+  "fallbackToDefault": false
 }
 ```
 
@@ -314,6 +360,7 @@ This is an example of the supported configuration keys with their default values
 | `codexModel`, optional | Selects a Codex model; otherwise existing Codex configuration decides. |
 | `openaiModel`, optional | Selects the model for the separate OpenAI text backend. |
 | `jobTimeoutMinutes` | Per-job timeout; default `30`, allowed range `1–120`. |
+| `fallbackToDefault` | When `true`, a completion webhook that failed on its owner's target is retried once on `default`. Default `false`. |
 
 Restart the gateway after editing `config.json`. Proxy switching is the exception: use its MCP tool without restarting.
 
@@ -324,16 +371,19 @@ Restart the gateway after editing `config.json`. Proxy switching is the exceptio
 | `projects_list` | `{}` | List eligible projects, warnings, and configured backend status. |
 | `proxy_status` | `{}` | Read the Codex proxy switch and selected execution backend. |
 | `proxy_set_enabled` | `enabled` | Persistently enable or disable Codex delegation. |
-| `codex_start` | `project`, `prompt`, `mode`, `requestId`, optional `notify` | Start a Codex task; `mode` defaults to `read-only`. |
-| `codex_followup` | `jobId`, `prompt`, `requestId`, optional `notify` | Continue a completed, retained Codex job with a session ID. |
-| `openai_start` | `prompt`, `requestId` | Start an independent OpenAI text request. |
+| `codex_start` | `project`, `prompt`, `mode`, `requestId`, optional `notify`/`owner` | Start a Codex task owned by `notify`; `mode` defaults to `read-only`. |
+| `codex_followup` | `jobId`, `prompt`, `requestId`, optional `notify`/`owner` | Continue a completed, retained Codex job with a session ID; inherits the parent owner by default. |
+| `openai_start` | `prompt`, `requestId`, optional `notify`/`owner` | Start an independent OpenAI text request. |
 | `job_status` | `jobId` | Read progress and job state. |
 | `job_result` | `jobId` | Read final text when the job is completed. |
 | `job_cancel` | `jobId` | Cancel queued work or terminate a running worker. |
+| `jobs_pending` | `owner` | List that owner's finished, unacknowledged jobs, newest first. |
+| `job_ack` | `jobId`, `owner` | Mark a finished job as reported; refused if `owner` does not match. |
+| `jobs_list` | `owner`, optional `limit` (1–100, default 20) | List that owner's jobs in any state, newest first. |
 
-One worker runs at a time across all projects and both backends. Up to 10 unfinished jobs are accepted, and up to 100 jobs are retained, with finished jobs removed first when capacity is needed. Prompts are limited to 32,000 characters, HTTP bodies to 128 KiB, and worker output to 1 MiB. Cancellation waits for the worker to close and terminates its process group; it does not undo edits already made.
+One worker runs at a time across all projects and both backends. Up to 10 unfinished jobs are accepted, and up to 100 jobs are retained, with finished jobs removed first when capacity is needed (acknowledged jobs before unacknowledged ones). Prompts are limited to 32,000 characters, HTTP bodies to 128 KiB, and worker output to 1 MiB. Cancellation waits for the worker to close and terminates its process group; it does not undo edits already made.
 
-Jobs and retry records live in memory. Restarting loses them, and graceful shutdown cancels unfinished work. Codex's own sessions may remain on disk under its retention policy, but the gateway does not replay lost jobs or adopt arbitrary existing sessions.
+Job and retry records are persisted in the private state directory (see *Pending results and acknowledgement*). Graceful shutdown cancels unfinished work; a crash leaves them to be marked `interrupted` at the next start. Unfinished work is never resumed. Codex's own sessions may remain on disk under its retention policy, but the gateway does not replay lost jobs or adopt arbitrary existing sessions.
 
 ## Optional OpenAI text backend
 
@@ -398,7 +448,7 @@ npm run check
 npm audit --include=dev
 ```
 
-Tests cover authenticated MCP exchanges, project eligibility, retry deduplication, serialized jobs, cancellation and timeout, proxy switching, child-process boundaries, and mocked OpenAI requests. They use fixture projects and workers; they do not spend API credits, read real credentials, or inspect real project contents. Live model execution and access from a particular Grok account require separate verification.
+Tests cover authenticated MCP exchanges, project eligibility, retry deduplication, owner routing, pending/ack isolation, job-record persistence, serialized jobs, cancellation and timeout, proxy switching, child-process boundaries, and mocked OpenAI requests. They use fixture projects and workers; they do not spend API credits, read real credentials, or inspect real project contents. Live model execution and access from a particular Grok account require separate verification.
 
 ## License and credits
 
