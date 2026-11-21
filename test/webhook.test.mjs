@@ -58,7 +58,7 @@ test('terminal jobs POST only the allowed metadata once, without prompt, output,
   assert.equal(headers['content-type'], 'application/json');
   const status = service.getStatus(job.jobId);
   assert.deepEqual(body, { event: 'codex_job_finished', jobId: job.jobId, kind: 'codex', state: 'completed',
-    owner: 'default', notify: 'default', route: 'default', projectName: 'Example', requestId: 'request-one', createdAt: status.createdAt, finishedAt: status.finishedAt, error: null });
+    owner: 'default', notify: 'default', route: 'default', requester: 'unknown', projectName: 'Example', requestId: 'request-one', createdAt: status.createdAt, finishedAt: status.finishedAt, error: null });
   assert.doesNotMatch(JSON.stringify(body), /PRIVATE_|EXAMPLE_NOT_A_SECRET|projectPath/);
   assert.equal(f.requests.length, 1);
 });
@@ -137,12 +137,12 @@ test('loaded legacy and named targets route starts and followups, including URL 
     webhookTargets: Object.keys(config.webhooks), defaultWebhook: config.defaultWebhook, onJobFinished: sender });
   t.after(() => service.close());
   const start = { project: project.id, prompt: 'PRIVATE_PROMPT', requestId: 'legacy' };
-  await assert.rejects(service.startCodex({ ...start, notify: 'missing' }), /Unknown notify target/);
+  await assert.rejects(service.startCodex({ ...start, notify: 'Not Valid' }), /notify\/owner must be/);
   const first = await service.startCodex(start);
   await until(() => deliveries.length === 1);
   assert.equal(deliveries[0].url, f.config.url);
   assert.equal(deliveries[0].body.notify, 'default');
-  await assert.rejects(service.followup({ jobId: first.jobId, prompt: 'fixture', requestId: 'bad', notify: 'missing' }), /Unknown notify target/);
+  await assert.rejects(service.followup({ jobId: first.jobId, prompt: 'fixture', requestId: 'bad', notify: 'Not Valid' }), /notify\/owner must be/);
   const next = await service.followup({ jobId: first.jobId, prompt: 'fixture', requestId: 'next', notify: 'main' });
   await until(() => deliveries.length === 2);
   assert.equal(service.getStatus(next.jobId).notify, 'main');

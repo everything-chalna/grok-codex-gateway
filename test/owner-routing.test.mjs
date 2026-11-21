@@ -35,7 +35,7 @@ const tempDir = async (t, prefix) => {
   return dir;
 };
 
-test('jobs record the owner from notify, owner alias or the default, and reject unknown names', async (t) => {
+test('jobs record the owner from notify, owner alias or the default, and reject malformed names', async (t) => {
   const service = setup();
   t.after(() => service.close());
   const input = { project: project.id, prompt: 'Review' };
@@ -45,8 +45,10 @@ test('jobs record the owner from notify, owner alias or the default, and reject 
   const implicit = await service.startCodex({ ...input, requestId: 'd' });
   assert.equal(implicit.owner, 'default');
   assert.equal(implicit.notify, 'default');
-  await assert.rejects(service.startCodex({ ...input, requestId: 'e', notify: 'sub2' }), /Unknown notify target/);
-  await assert.rejects(service.startCodex({ ...input, requestId: 'f', owner: 'sub2' }), /Unknown notify target/);
+  assert.equal(implicit.requester, 'unknown');
+  await assert.rejects(service.startCodex({ ...input, requestId: 'e', notify: 'Sub 2' }), /notify\/owner must be/);
+  await assert.rejects(service.startCodex({ ...input, requestId: 'f', owner: 'x'.repeat(33) }), /notify\/owner must be/);
+  await assert.rejects(service.startCodex({ ...input, requestId: 'h', requester: 'Side!' }), /requester must be/);
   await assert.rejects(service.startCodex({ ...input, requestId: 'g', owner: 'main', notify: 'side2' }), /same target/);
 });
 
@@ -62,7 +64,7 @@ test('followups inherit the parent owner unless notify or owner is explicit', as
   await settled(service, inherited.jobId);
   const overridden = await service.followup({ jobId: parent.jobId, prompt: 'Other', requestId: 'override', owner: 'main' });
   assert.equal(overridden.owner, 'main');
-  await assert.rejects(service.followup({ jobId: parent.jobId, prompt: 'Bad', requestId: 'bad', notify: 'nobody' }), /Unknown notify target/);
+  await assert.rejects(service.followup({ jobId: parent.jobId, prompt: 'Bad', requestId: 'bad', notify: 'No Body' }), /notify\/owner must be/);
 });
 
 test('jobs_pending and job_ack are isolated per owner', async (t) => {
@@ -223,4 +225,100 @@ test('completion webhooks go only to the owner target and record delivery status
   assert.equal(fallback.delivery.route, 'default');
   assert.equal(fallback.delivery.fallbackFrom, 'side2');
   assert.equal(fallback.delivery.attempts, 3);
+});
+
+test('unconfigured notify/owner names route to defaultWebhook and are recorded as requester', async (t) => {
+  const service = setup({ defaultWebhook: 'main' });
+  t.after(() => service.close());
+  const input = { project: project.id, prompt: 'Review' };
+  const viaNotify = await service.startCodex({ ...input, requestId: 'a', notify: 'side' });
+  assert.equal(viaNotify.owner, 'main');
+  assert.equal(viaNotify.notify, 'main');
+  assert.equal(viaNotify.requester, 'side');
+  const viaOwner = await service.startCodex({ ...input, requestId: 'b', owner: 'newsbot' });
+  assert.equal(viaOwner.owner, 'main');
+  assert.equal(viaOwner.requester, 'newsbot');
+  // An explicit requester wins over the notify name; configured targets keep their own route.
+  const both = await service.startCodex({ ...input, requestId: 'c', notify: 'side2', requester: 'sub1' });
+  assert.equal(both.owner, 'side2');
+  assert.equal(both.requester, 'sub1');
+  const self = await service.startCodex({ ...input, requestId: 'd', notify: 'side2' });
+  assert.equal(self.requester, 'side2');
+  const requesterOnly = await service.startCodex({ ...input, requestId: 'e', requester: 'sub2' });
+  assert.equal(requesterOnly.owner, 'main');
+  assert.equal(requesterOnly.requester, 'sub2');
+  // Retries with the same requestId are deduplicated; a different requester is a different request.
+  assert.equal((await service.startCodex({ ...input, requestId: 'a', notify: 'side' })).jobId, viaNotify.jobId);
+  await assert.rejects(service.startCodex({ ...input, requestId: 'a', notify: 'sub1' }), /different request/);
+  for (const job of [viaNotify, viaOwner, both, self, requesterOnly]) await settled(service, job.jobId);
+  const pending = service.listPending({ owner: 'main' });
+  assert.deepEqual(new Set(pending.jobs.map(job => job.requester)), new Set(['side', 'newsbot', 'sub2']));
+  assert.equal(service.getResult(viaNotify.jobId).requester, 'side');
+  assert.equal(service.listJobs({ owner: 'side2' }).jobs.every(job => typeof job.requester === 'string'), true);
+  // Owner filters still accept only configured targets.
+  assert.throws(() => service.listPending({ owner: 'side' }), /owner must name/);
+  assert.throws(() => service.ack({ jobId: viaNotify.jobId, owner: 'side' }), /owner must name/);
+  assert.equal(service.ack({ jobId: viaNotify.jobId, owner: 'main' }).acked, true);
+});
+
+test('followups inherit the parent requester unless one is given', async (t) => {
+  const service = setup({ defaultWebhook: 'main' });
+  t.after(() => service.close());
+  const parent = await service.startCodex({ project: project.id, prompt: 'Start', requestId: 'p', requester: 'side' });
+  await settled(service, parent.jobId);
+  const inherited = await service.followup({ jobId: parent.jobId, prompt: 'More', requestId: 'f1' });
+  assert.equal(inherited.requester, 'side');
+  assert.equal(inherited.owner, 'main');
+  await settled(service, inherited.jobId);
+  const viaNotify = await service.followup({ jobId: parent.jobId, prompt: 'More', requestId: 'f2', notify: 'sub1' });
+  assert.equal(viaNotify.requester, 'sub1');
+  assert.equal(viaNotify.owner, 'main');
+  await settled(service, viaNotify.jobId);
+  const explicit = await service.followup({ jobId: parent.jobId, prompt: 'More', requestId: 'f3', requester: 'newsbot', owner: 'side2' });
+  assert.equal(explicit.requester, 'newsbot');
+  assert.equal(explicit.owner, 'side2');
+});
+
+test('openai_start records requester and falls back to defaultWebhook', async (t) => {
+  const service = setup({ defaultWebhook: 'main', openAIWorker: async () => ({ text: 'Done' }) });
+  t.after(() => service.close());
+  const job = await service.startOpenAI({ prompt: 'Hi', requestId: 'o1', notify: 'side' });
+  assert.equal(job.owner, 'main');
+  assert.equal(job.requester, 'side');
+  const plain = await service.startOpenAI({ prompt: 'Hi', requestId: 'o2' });
+  assert.equal(plain.requester, 'unknown');
+});
+
+test('requester is persisted, restored, and old records without it restore as unknown', async (t) => {
+  const dir = await tempDir(t, 'gateway-requester-store-');
+  const first = setup({ defaultWebhook: 'main', store: await createJobStore(dir, { log: () => {} }) });
+  const job = await first.startCodex({ project: project.id, prompt: 'PRIVATE_PROMPT', requestId: 'r1', notify: 'side' });
+  await settled(first, job.jobId);
+  await first.close();
+  const file = join(dir, `${job.jobId}.json`);
+  const record = JSON.parse(await readFile(file, 'utf8'));
+  assert.equal(record.requester, 'side');
+  assert.equal(record.owner, 'main');
+  const legacy = { ...record, id: '00000000-0000-4000-8000-000000000001', requestId: 'legacy-1' };
+  delete legacy.requester;
+  await writeFile(join(dir, `${legacy.id}.json`), JSON.stringify(legacy));
+  const second = setup({ defaultWebhook: 'main', store: await createJobStore(dir, { log: () => {} }) });
+  t.after(() => second.close());
+  assert.equal(second.getStatus(job.jobId).requester, 'side');
+  assert.equal(second.getStatus(legacy.id).requester, 'unknown');
+  // Retrying the original request after restart still deduplicates.
+  assert.equal((await second.startCodex({ project: project.id, prompt: 'PRIVATE_PROMPT', requestId: 'r1', notify: 'side' })).jobId, job.jobId);
+});
+
+test('webhook payload carries the requester and goes to the default target for unconfigured bots', async (t) => {
+  const events = [];
+  const service = setup({ defaultWebhook: 'main', onJobFinished: event => { events.push(event); return { status: 'delivered', attempts: 1, httpStatus: 204 }; } });
+  t.after(() => service.close());
+  const job = await service.startCodex({ project: project.id, prompt: 'PRIVATE_PROMPT', requestId: 'w1', requester: 'side' });
+  await settled(service, job.jobId);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].owner, 'main');
+  assert.equal(events[0].route, 'main');
+  assert.equal(events[0].requester, 'side');
+  assert.doesNotMatch(JSON.stringify(events[0]), /PRIVATE_/);
 });

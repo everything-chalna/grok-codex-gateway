@@ -265,10 +265,29 @@ or start with `~/`. Headers default to `headerName: "Authorization"` and
 
 Every job has an **owner**: the webhook target name of the bot that started it.
 `codex_start`, `codex_followup` and `openai_start` accept `notify: "main"` or the
-alias `owner: "main"` (if both are given they must match). Unknown names are
-rejected before a job is accepted. Omission uses `defaultWebhook` (default
-`"default"`). `codex_followup` without `notify`/`owner` **inherits the parent
-job's owner**; pass one explicitly only to hand the followup to another bot.
+alias `owner: "main"` (if both are given they must match). Malformed names are
+rejected. A well-formed name **without its own configured target** (for example
+`side`, `sub1`, `newsbot`) is not an error: the job is owned by, and its
+completion delivered to, `defaultWebhook`, and the name is kept as the job's
+requester. Omission also uses `defaultWebhook` (default `"default"`).
+`codex_followup` without `notify`/`owner` **inherits the parent job's owner**;
+pass one explicitly only to hand the followup to another bot.
+
+### Requester: who started the job
+
+Every job also records a **requester**, a free label for the bot that started
+it (same name format as targets; it does not need a configured target). Pass
+`requester: "<your bot id>"` on every `codex_start`, `codex_followup` and
+`openai_start`. Resolution: explicit `requester`, else the `notify`/`owner` name
+(even if unconfigured), else `"unknown"`. `codex_followup` without one inherits
+the parent's requester. The requester is persisted in job records (older records
+restore as `"unknown"`) and appears in `job_status`, `job_result`,
+`jobs_pending`, `jobs_list` and the completion webhook.
+
+Bots with their own webhook target pass `notify` and `requester`. Bots without
+one pass only `requester`; their jobs are delivered to `defaultWebhook` (set it
+to `main`), and Main forwards each finished job whose `requester` is not `main`
+to that bot.
 
 Several Grok Bots can share one gateway token, so the gateway cannot tell them
 apart by itself. **Each bot must always pass its own target name** on every
@@ -291,7 +310,7 @@ notification. Use private file permissions such as `0600` for config and files.
 Completed, failed, cancelled and timed-out jobs send one JSON POST **to the
 owner's target only** with `event: "codex_job_finished"`, `jobId`, `kind`,
 `owner`, `notify` (same as owner, kept for compatibility), `route` (the target
-actually used), `state`, `projectName`, `requestId`, `createdAt`, `finishedAt`,
+actually used), `requester` (the bot that started the job), `state`, `projectName`, `requestId`, `createdAt`, `finishedAt`,
 and `error`. OpenAI jobs have a null project name; errors are generic, with null
 for jobs without an error. Prompts, result text, paths and credentials are
 excluded. Each attempt has a 10-second timeout; network errors and HTTP 5xx
@@ -371,9 +390,9 @@ Restart the gateway after editing `config.json`. Proxy switching is the exceptio
 | `projects_list` | `{}` | List eligible projects, warnings, and configured backend status. |
 | `proxy_status` | `{}` | Read the Codex proxy switch and selected execution backend. |
 | `proxy_set_enabled` | `enabled` | Persistently enable or disable Codex delegation. |
-| `codex_start` | `project`, `prompt`, `mode`, `requestId`, optional `notify`/`owner` | Start a Codex task owned by `notify`; `mode` defaults to `read-only`. |
-| `codex_followup` | `jobId`, `prompt`, `requestId`, optional `notify`/`owner` | Continue a completed, retained Codex job with a session ID; inherits the parent owner by default. |
-| `openai_start` | `prompt`, `requestId`, optional `notify`/`owner` | Start an independent OpenAI text request. |
+| `codex_start` | `project`, `prompt`, `mode`, `requestId`, optional `notify`/`owner`, `requester` | Start a Codex task owned by `notify`; `mode` defaults to `read-only`. |
+| `codex_followup` | `jobId`, `prompt`, `requestId`, optional `notify`/`owner`, `requester` | Continue a completed, retained Codex job with a session ID; inherits the parent owner by default. |
+| `openai_start` | `prompt`, `requestId`, optional `notify`/`owner`, `requester` | Start an independent OpenAI text request. |
 | `job_status` | `jobId` | Read progress and job state. |
 | `job_result` | `jobId` | Read final text when the job is completed. |
 | `job_cancel` | `jobId` | Cancel queued work or terminate a running worker. |

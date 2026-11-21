@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add an optional `requester` label (who started the job) to `codex_start`, `codex_followup` (inherits the parent's) and `openai_start`; resolve it as explicit requester, else the notify/owner name, else `unknown`. Persist it (old records restore as `unknown`) and include it in job_status, job_result, jobs_pending, jobs_list and the completion webhook.
+- Well-formed `notify`/`owner` names without a configured target no longer fail: the job is routed to `defaultWebhook` and the name is recorded as requester. Malformed names are still rejected. Tool descriptions tell bots to always pass `requester` and pass `notify` only with their own target.
+
 - Record an `owner` on every job (the `notify` target, new alias `owner`, or `defaultWebhook`). `codex_followup` now inherits the parent job's owner instead of falling back to the default target; unknown names are still rejected.
 - Persist job records (owner, request fingerprint, state, timestamps, exit code, completed result and session ID, acknowledgement, delivery status; never prompts) atomically to `state/jobs/` in the private config directory, restore them at startup, and mark previously unfinished jobs `interrupted`.
 - Send completion webhooks only to the owner's target, add `owner` and `route` to the payload, and record delivery status on the job. Failed deliveries are not sent to other bots unless the new `fallbackToDefault` setting is enabled.

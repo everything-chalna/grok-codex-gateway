@@ -34,16 +34,33 @@ export function createService({ discover, codexWorker, openAIWorker = null,
   maxJobs = 100, maxQueue = 10, jobTimeoutMs = 30 * 60_000 }) {
   const targets = new Set(webhookTargets);
   const knownOwner = name => typeof name === 'string' && TARGET_NAME.test(name) && (targets.has(name) || name === defaultWebhook);
-  // `owner` is an alias of `notify`; both name a configured webhook target.
+  // `owner` is an alias of `notify`. A well-formed name without its own
+  // configured target is not an error: the job is routed to defaultWebhook
+  // (which forwards it) and the name is kept as the job's requester.
+  // Returns { name, owner } or undefined when neither was supplied.
   const explicitOwner = ({ notify, owner } = {}) => {
     for (const name of [notify, owner]) {
-      if (name !== undefined && !knownOwner(name)) throw new GatewayError('Unknown notify target. Use a configured webhook target name.');
+      if (name !== undefined && (typeof name !== 'string' || !TARGET_NAME.test(name))) {
+        throw new GatewayError('notify/owner must be 1-32 lowercase letters, digits, underscores or hyphens.');
+      }
     }
     if (notify !== undefined && owner !== undefined && notify !== owner) {
       throw new GatewayError('notify and owner must name the same target when both are supplied.');
     }
-    return notify ?? owner;
+    const name = notify ?? owner;
+    if (name === undefined) return undefined;
+    return { name, owner: knownOwner(name) ? name : defaultWebhook };
   };
+  // requester: free label of the bot that started the job (need not be a
+  // configured target). Used for forwarding and audit, never for routing.
+  const explicitRequester = (requester) => {
+    if (requester === undefined) return undefined;
+    if (typeof requester !== 'string' || !TARGET_NAME.test(requester)) {
+      throw new GatewayError('requester must be 1-32 lowercase letters, digits, underscores or hyphens.');
+    }
+    return requester;
+  };
+  const validRequester = value => typeof value === 'string' && TARGET_NAME.test(value) ? value : 'unknown';
   const ownerFilter = owner => {
     if (!knownOwner(owner)) throw new GatewayError('owner must name a configured webhook target.');
     return owner;
@@ -68,7 +85,7 @@ export function createService({ discover, codexWorker, openAIWorker = null,
     return job;
   };
   const toRecord = (job) => ({
-    version: 1, id: job.id, kind: job.kind, owner: job.owner, requestId: job.requestId,
+    version: 1, id: job.id, kind: job.kind, owner: job.owner, requester: job.requester, requestId: job.requestId,
     fingerprint: job.fingerprint, parentJobId: job.parentJobId ?? null,
     project: job.project ? { id: job.project.id, name: job.project.name ?? null, path: job.project.path } : null,
     mode: job.payload.mode ?? null, state: job.state, progress: job.progress ?? null,
@@ -81,14 +98,14 @@ export function createService({ discover, codexWorker, openAIWorker = null,
   // Persist only retained jobs; never the prompt (it is not in the record).
   const persist = (job) => { if (store && jobs.get(job.id) === job) void store.save(toRecord(job)); };
   const status = (job) => ({
-    jobId: job.id, kind: job.kind, owner: job.owner, notify: job.owner, requestId: job.requestId,
+    jobId: job.id, kind: job.kind, owner: job.owner, notify: job.owner, requester: job.requester, requestId: job.requestId,
     parentJobId: job.parentJobId ?? null, state: job.state, project: job.project?.id,
     mode: job.payload.mode, createdAt: job.createdAt, startedAt: job.startedAt,
     finishedAt: job.finishedAt, progress: job.progress, error: job.error,
     exitCode: EXIT_CODES[job.state] ?? null, acked: job.acked, ackedAt: job.ackedAt, delivery: job.delivery,
   });
   const summary = (job) => ({
-    jobId: job.id, requestId: job.requestId, kind: job.kind, owner: job.owner,
+    jobId: job.id, requestId: job.requestId, kind: job.kind, owner: job.owner, requester: job.requester,
     project: job.project?.id ?? null, projectName: job.project?.name ?? null, state: job.state,
     createdAt: job.createdAt, finishedAt: job.finishedAt ?? null, error: job.error ?? null,
     acked: job.acked, delivery: job.delivery,
@@ -96,7 +113,7 @@ export function createService({ discover, codexWorker, openAIWorker = null,
   const notifyFinished = (job) => {
     // Explicit allowlist: never send worker output, prompts, paths or raw errors.
     const event = { event: 'codex_job_finished', jobId: job.id, kind: job.kind,
-      owner: job.owner, notify: job.owner, route: job.owner,
+      owner: job.owner, notify: job.owner, route: job.owner, requester: job.requester,
       state: job.state, projectName: job.project?.name ?? null, requestId: job.requestId,
       createdAt: job.createdAt, finishedAt: job.finishedAt,
       error: job.error ? 'Worker failed.' : null };
@@ -126,7 +143,8 @@ export function createService({ discover, codexWorker, openAIWorker = null,
       && typeof record.createdAt === 'string' && typeof record.owner === 'string' && TARGET_NAME.test(record.owner))
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   for (const record of restored) {
-    const job = { id: record.id, kind: record.kind, owner: record.owner, requestId: record.requestId,
+    // Records written before requester existed restore as 'unknown'.
+    const job = { id: record.id, kind: record.kind, owner: record.owner, requester: validRequester(record.requester), requestId: record.requestId,
       fingerprint: record.fingerprint, parentJobId: record.parentJobId ?? null,
       project: record.project ?? undefined,
       payload: { ...(record.project ? { projectPath: record.project.path } : {}), ...(record.mode ? { mode: record.mode } : {}) },
@@ -210,6 +228,11 @@ export function createService({ discover, codexWorker, openAIWorker = null,
     if (!project) throw new GatewayError('Unknown or ineligible project. Use projects_list first.');
     return project;
   }
+  // Keep fingerprints of pre-requester requests stable: the requester joins the
+  // identity only when it differs from the (configured) owner and is known.
+  function withRequester(identity, requester, owner) {
+    return requester && requester !== 'unknown' && requester !== owner ? { ...identity, requester } : identity;
+  }
   function requestFingerprint(input) {
     return createHash('sha256').update(JSON.stringify(input)).digest('hex');
   }
@@ -219,7 +242,7 @@ export function createService({ discover, codexWorker, openAIWorker = null,
     if (previous.fingerprint !== requestFingerprint(identity)) throw new GatewayError('requestId already belongs to a different request.');
     return status(get(previous.jobId));
   }
-  function enqueue(kind, payload, requestId, project, identity, owner = defaultWebhook, parentJobId = null) {
+  function enqueue(kind, payload, requestId, project, identity, owner = defaultWebhook, parentJobId = null, requester = 'unknown') {
     if (stopping) throw new GatewayError('Gateway is shutting down.');
     if (typeof requestId !== 'string' || !/^[a-zA-Z0-9_.:-]{1,100}$/.test(requestId)) {
       throw new GatewayError('Supply a requestId of 1–100 letters, digits, dots, colons, underscores or hyphens.');
@@ -239,7 +262,7 @@ export function createService({ discover, codexWorker, openAIWorker = null,
     }
     prune();
     if (jobs.size >= maxJobs) throw new GatewayError('Job capacity reached.');
-    const job = { id: randomUUID(), kind, payload: { ...payload }, requestId, fingerprint, project, owner, parentJobId,
+    const job = { id: randomUUID(), kind, payload: { ...payload }, requestId, fingerprint, project, owner, requester, parentJobId,
       state: 'queued', createdAt: new Date().toISOString(), progress: 'queued', acked: false, ackedAt: null, delivery: null };
     jobs.set(job.id, job);
     requests.set(requestId, { fingerprint, jobId: job.id });
@@ -265,20 +288,25 @@ export function createService({ discover, codexWorker, openAIWorker = null,
       const result = await discover();
       return { ...result, backends: { codex: proxyEnabled, openai: Boolean(openAIWorker) } };
     },
-    async startCodex({ project: id, prompt, mode = 'read-only', requestId, notify, owner }) {
-      owner = explicitOwner({ notify, owner }) ?? defaultWebhook;
+    async startCodex({ project: id, prompt, mode = 'read-only', requestId, notify, owner, requester }) {
+      const target = explicitOwner({ notify, owner });
+      owner = target?.owner ?? defaultWebhook;
+      requester = explicitRequester(requester) ?? target?.name ?? 'unknown';
       if (!['read-only', 'workspace-write', 'workspace-write-git'].includes(mode)) throw new GatewayError('Unsupported sandbox mode.');
-      const identity = { kind: 'codex', project: id, prompt, mode, notify: owner };
+      const identity = withRequester({ kind: 'codex', project: id, prompt, mode, notify: owner }, requester, owner);
       const existing = retry(requestId, identity);
       if (existing) return existing;
       requireProxy();
       const project = await resolveProject(id);
-      return enqueue('codex', { projectPath: project.path, prompt, mode }, requestId, project, identity, owner);
+      return enqueue('codex', { projectPath: project.path, prompt, mode }, requestId, project, identity, owner, null, requester);
     },
-    async followup({ jobId, prompt, requestId, notify, owner }) {
-      // Without an explicit target the followup belongs to the parent's owner.
-      const explicit = explicitOwner({ notify, owner });
-      const identity = { kind: 'followup', jobId, prompt, notify: explicit ?? null };
+    async followup({ jobId, prompt, requestId, notify, owner, requester }) {
+      // Without an explicit target the followup belongs to the parent's owner
+      // and, without an explicit requester, to the parent's requester.
+      const target = explicitOwner({ notify, owner });
+      const explicit = target?.owner;
+      const named = explicitRequester(requester) ?? target?.name;
+      const identity = withRequester({ kind: 'followup', jobId, prompt, notify: explicit ?? null }, named ?? null, explicit ?? null);
       const existing = retry(requestId, identity);
       if (existing) return existing;
       requireProxy();
@@ -288,12 +316,16 @@ export function createService({ discover, codexWorker, openAIWorker = null,
       }
       const project = await resolveProject(previous.project.id);
       return enqueue('codex', { projectPath: project.path, prompt, mode: previous.payload.mode,
-        threadId: previous.result.threadId }, requestId, project, identity, explicit ?? previous.owner ?? defaultWebhook, previous.id);
+        threadId: previous.result.threadId }, requestId, project, identity, explicit ?? previous.owner ?? defaultWebhook, previous.id,
+        named ?? validRequester(previous.requester));
     },
-    async startOpenAI({ prompt, requestId, notify, owner }) {
-      owner = explicitOwner({ notify, owner }) ?? defaultWebhook;
+    async startOpenAI({ prompt, requestId, notify, owner, requester }) {
+      const target = explicitOwner({ notify, owner });
+      owner = target?.owner ?? defaultWebhook;
+      requester = explicitRequester(requester) ?? target?.name ?? 'unknown';
       if (!openAIWorker) throw new GatewayError('OpenAI text backend is not configured on this computer.');
-      return enqueue('openai', { prompt }, requestId, undefined, { kind: 'openai', prompt, notify: owner }, owner);
+      return enqueue('openai', { prompt }, requestId, undefined,
+        withRequester({ kind: 'openai', prompt, notify: owner }, requester, owner), owner, null, requester);
     },
     getStatus(id) { return status(get(id)); },
     getResult(id) {

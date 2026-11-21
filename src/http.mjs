@@ -44,20 +44,20 @@ function createToolServer(service) {
     'List local projects eligible for Codex through their AGENTS.md or the configured Ganglia registry. Use the returned project ID when starting work.',
     z.object({}).strict(), () => service.listProjects(), true);
   register('codex_start',
-    'Start a local Codex job in a listed project. Defaults to read-only. workspace-write allows project edits. workspace-write-git additionally allows writes to that project\'s .git directory and outbound network access for git push/GitHub CLI; use only with explicit user authorization. Pass notify (or its alias owner) set to your own configured webhook target name: it becomes the job owner, receives the completion webhook, and is the owner for jobs_pending/job_ack. Omitted uses defaultWebhook. Returns a job ID; poll job_status and read job_result.',
-    z.object({ project: idSchema, prompt: promptSchema, notify: targetSchema.optional(), owner: targetSchema.optional(), mode: z.enum(['read-only', 'workspace-write', 'workspace-write-git']).default('read-only'), requestId: requestIdSchema }).strict(),
+    'Start a local Codex job in a listed project. Defaults to read-only. workspace-write allows project edits. workspace-write-git additionally allows writes to that project\'s .git directory and outbound network access for git push/GitHub CLI; use only with explicit user authorization. Always pass requester set to your own bot id label (for example main, side, side2, sub1, newsbot); it is recorded on the job and in the completion webhook. Pass notify (or its alias owner) only if you have your own configured webhook target; it becomes the job owner, receives the completion webhook, and is the owner for jobs_pending/job_ack. Jobs from bots without their own target (notify omitted or not configured) are owned by defaultWebhook (Main), which forwards each result to its requester. Returns a job ID; poll job_status and read job_result.',
+    z.object({ project: idSchema, prompt: promptSchema, notify: targetSchema.optional(), owner: targetSchema.optional(), requester: targetSchema.optional(), mode: z.enum(['read-only', 'workspace-write', 'workspace-write-git']).default('read-only'), requestId: requestIdSchema }).strict(),
     (input) => service.startCodex(input));
   register('proxy_status', 'Read the Codex proxy mode and chosen project execution backend. Subscription balance is unknown; switching is manual.',
     z.object({}).strict(), () => service.proxyStatus(), true);
   register('proxy_set_enabled', 'Persist the Codex proxy mode. Disabled selects Grok approved local Shell for new project work; existing jobs remain accessible and continue.',
     z.object({ enabled: z.boolean() }).strict(), ({ enabled }) => service.setProxyEnabled(enabled));
   register('codex_followup',
-    'Continue a completed Codex job with another prompt, retaining its project, sandbox mode and owner. Optional notify (or alias owner) overrides the owner; omitted inherits the parent job\'s owner. Returns a new job ID.',
-    z.object({ jobId: idSchema, prompt: promptSchema, notify: targetSchema.optional(), owner: targetSchema.optional(), requestId: requestIdSchema }).strict(),
+    'Continue a completed Codex job with another prompt, retaining its project, sandbox mode, owner and requester. Optional notify (or alias owner) overrides the owner and optional requester overrides the requester; omitted values inherit the parent job\'s. Pass notify (or its alias owner) only if you have your own configured webhook target; it becomes the job owner, receives the completion webhook, and is the owner for jobs_pending/job_ack. Jobs from bots without their own target (notify omitted or not configured) are owned by defaultWebhook (Main), which forwards each result to its requester. Returns a new job ID.',
+    z.object({ jobId: idSchema, prompt: promptSchema, notify: targetSchema.optional(), owner: targetSchema.optional(), requester: targetSchema.optional(), requestId: requestIdSchema }).strict(),
     (input) => service.followup(input));
   register('openai_start',
-    'Start an OpenAI API text job. Requires the locally configured API backend; this does not control an existing ChatGPT conversation. Optional notify (or alias owner) names the owner as for codex_start. Returns a job ID.',
-    z.object({ prompt: promptSchema, notify: targetSchema.optional(), owner: targetSchema.optional(), requestId: requestIdSchema }).strict(),
+    'Start an OpenAI API text job. Requires the locally configured API backend; this does not control an existing ChatGPT conversation. requester, notify and owner work as for codex_start. Always pass requester set to your own bot id label (for example main, side, side2, sub1, newsbot); it is recorded on the job and in the completion webhook. Pass notify (or its alias owner) only if you have your own configured webhook target; it becomes the job owner, receives the completion webhook, and is the owner for jobs_pending/job_ack. Jobs from bots without their own target (notify omitted or not configured) are owned by defaultWebhook (Main), which forwards each result to its requester. Returns a job ID.',
+    z.object({ prompt: promptSchema, notify: targetSchema.optional(), owner: targetSchema.optional(), requester: targetSchema.optional(), requestId: requestIdSchema }).strict(),
     (input) => service.startOpenAI(input));
   register('job_status', 'Read the status of a gateway job.',
     z.object({ jobId: idSchema }).strict(), ({ jobId }) => service.getStatus(jobId), true);
@@ -66,7 +66,7 @@ function createToolServer(service) {
   register('job_cancel', 'Cancel a running gateway job.',
     z.object({ jobId: idSchema }).strict(), ({ jobId }) => service.cancel(jobId));
   register('jobs_pending',
-    'List your finished (completed, failed, cancelled, timed_out, interrupted) jobs that you have not acknowledged yet, newest first. owner is your own notify target name. Job records persist across gateway restarts, so call this on every wakeup: the webhook only reduces latency and can be missed. Report each result, then job_ack it.',
+    'List your finished (completed, failed, cancelled, timed_out, interrupted) jobs that you have not acknowledged yet, newest first. owner is your own configured notify target name (Main also sees jobs of bots without a target; each item has requester). Job records persist across gateway restarts, so call this on every wakeup: the webhook only reduces latency and can be missed. Report each result, then job_ack it.',
     z.object({ owner: targetSchema }).strict(), (input) => service.listPending(input), true);
   register('job_ack',
     'Mark one of your finished jobs as reported so jobs_pending stops listing it. Refused when owner does not match the job owner; never acknowledge another bot\'s job.',
